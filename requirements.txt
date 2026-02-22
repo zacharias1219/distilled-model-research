@@ -1,0 +1,7 @@
+torch>=2.0.0
+transformers>=4.36.0
+datasets>=2.14.0
+easydistill
+bitsandbytes>=0.41.0
+tqdm
+accelerate>=0.25.0
