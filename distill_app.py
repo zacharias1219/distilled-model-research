@@ -13,8 +13,17 @@ Responsibilities:
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import List, Dict, Literal, Optional, Any
+
+# Load .env from project root so HF_TOKEN is available for Hugging Face Hub
+try:
+    from dotenv import load_dotenv
+    _root = Path(__file__).resolve().parent
+    load_dotenv(_root / ".env")
+except ImportError:
+    pass
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -192,7 +201,42 @@ def prepare_system2_dataset(
     Loads OmniThought, optionally filters by RV/CD, and maps to
     {instruction, input, output=cot}.
     """
-    omni = load_dataset("alibaba-pai/OmniThought", split=slice_str)
+    # Skip split size verification to avoid NonMatchingSplitsSizesError (e.g. partial
+    # cache or dataset metadata mismatch).
+    def _is_split_error(e: Exception) -> bool:
+        return "NonMatchingSplitsSizesError" in type(e).__name__ or "non_matching" in str(e).lower()
+
+    try:
+        omni = load_dataset(
+            "alibaba-pai/OmniThought",
+            split=slice_str,
+            trust_remote_code=True,
+            verification_mode="no_checks",
+        )
+    except TypeError:
+        try:
+            omni = load_dataset("alibaba-pai/OmniThought", split=slice_str, trust_remote_code=True)
+        except Exception as e2:
+            if _is_split_error(e2):
+                omni = load_dataset(
+                    "alibaba-pai/OmniThought",
+                    split=slice_str,
+                    trust_remote_code=True,
+                    download_mode="force_redownload",
+                )
+            else:
+                raise
+    except Exception as e:
+        if _is_split_error(e):
+            omni = load_dataset(
+                "alibaba-pai/OmniThought",
+                split=slice_str,
+                trust_remote_code=True,
+                verification_mode="no_checks",
+                download_mode="force_redownload",
+            )
+        else:
+            raise
     print("First OmniThought sample keys:", list(omni[0].keys()))
 
     if not (
@@ -336,9 +380,10 @@ def run_easy_distill(config_path: str) -> int:
     """Run EasyDistill CLI with the given config. Returns the subprocess return code.
     Config path is resolved to absolute so EasyDistill (which joins relative paths with
     its package dir) loads the correct file when we run from our project root.
+    Uses the same Python as the current process so the CLI is found after pip install -e.
     """
     abs_config = str(Path(config_path).resolve())
-    cmd = ["easydistill", "--config", abs_config]
+    cmd = [sys.executable, "-m", "easydistill.cli", "--config", abs_config]
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd)
     if result.returncode == 0:

@@ -34,6 +34,15 @@ pip install -r requirements.txt
 
 **Under 5 minutes to start:** Open `notebook.ipynb` in Colab → Runtime → Change runtime type → GPU → Run the first two setup cells. Then run System 1 config + Prepare Data + Run Distillation when ready.
 
+## Hugging Face token (optional but recommended)
+
+The repo does **not** include `.env` or any secrets (they are in `.gitignore`). After you clone or open the notebook from GitHub:
+
+- **Colab:** Add your Hugging Face token once: click the key icon in the left sidebar → Add new secret → name `HF_TOKEN`, value your token → run the notebook’s “HF token (optional)” cell so the token is used for dataset/model downloads and higher rate limits.
+- **Local:** Create a `.env` file in the repo root with one line: `HF_TOKEN=hf_...`. It is loaded automatically when you `import distill_app`.
+
+Without a token, downloads still work but you may see rate-limit warnings.
+
 ## EasyDistill setup
 
 The notebook clones [EasyDistill](https://github.com/modelscope/easydistill) and installs it so we can run KD training. Two things matter:
