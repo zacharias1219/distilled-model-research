@@ -234,32 +234,28 @@ def prepare_system2_dataset(
     def _is_split_error(e: Exception) -> bool:
         return "NonMatchingSplitsSizesError" in type(e).__name__ or "non_matching" in str(e).lower()
 
+    # Prefer Parquet (no trust_remote_code). Fallback for older datasets lib or split errors.
     try:
         omni = load_dataset(
             "alibaba-pai/OmniThought",
             split=slice_str,
-            trust_remote_code=True,
             verification_mode="no_checks",
         )
-    except TypeError:
-        try:
-            omni = load_dataset("alibaba-pai/OmniThought", split=slice_str, trust_remote_code=True)
-        except Exception as e2:
-            if _is_split_error(e2):
+    except Exception as e:
+        if "trust_remote_code" in str(e).lower() or "custom code" in str(e).lower():
+            try:
                 omni = load_dataset(
                     "alibaba-pai/OmniThought",
                     split=slice_str,
                     trust_remote_code=True,
-                    download_mode="force_redownload",
+                    verification_mode="no_checks",
                 )
-            else:
-                raise
-    except Exception as e:
-        if _is_split_error(e):
+            except TypeError:
+                omni = load_dataset("alibaba-pai/OmniThought", split=slice_str, trust_remote_code=True)
+        elif _is_split_error(e):
             omni = load_dataset(
                 "alibaba-pai/OmniThought",
                 split=slice_str,
-                trust_remote_code=True,
                 verification_mode="no_checks",
                 download_mode="force_redownload",
             )
