@@ -32,7 +32,9 @@ pip install -r requirements.txt
 # Visit:  Run cells in order (Setup → System 1 → System 2 → Comparison)
 ```
 
-**Under 5 minutes to start:** Open `notebook.ipynb` in Colab → Runtime → Change runtime type → GPU → Run the first two setup cells. Then run System 1 config + Prepare Data + Run Distillation when ready.
+**Under 5 minutes to start:** Open `notebook.ipynb` in Colab → Runtime → Change runtime type → **GPU** (or **TPU** for faster training) → Run the setup cells. Then run System 1 config + Prepare Data + Run Distillation when ready.
+
+**TPU:** If you select a TPU runtime, run the **TPU setup** cell after the dependency install. Teacher labeling and System 1 training then run on TPU (no vllm; we use Hugging Face generate + in-notebook TPU training). System 2 (CoT) still uses the GPU-oriented EasyDistill path.
 
 ## Hugging Face token (optional but recommended)
 

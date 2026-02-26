@@ -12,6 +12,7 @@ Responsibilities:
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -50,16 +51,43 @@ def read_json(path: str) -> Any:
 # Teacher loading & labeling
 # ---------------------------
 
-def load_teacher(model_name: str):
+def _is_tpu() -> bool:
+    """True if TPU is available (e.g. Colab TPU runtime)."""
+    if os.environ.get("COLAB_TPU_ADDR"):
+        return True
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xrt_world_size() > 0
+    except Exception:
+        return False
+
+
+def load_teacher(model_name: str, use_tpu: Optional[bool] = None):
     """
-    Load teacher model in 8-bit if possible to save VRAM.
+    Load teacher model. On GPU: 8-bit, device_map='auto'. On TPU: full precision on XLA device.
+    use_tpu: if None, auto-detect from _is_tpu().
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        load_in_8bit=True,
-    )
+    if use_tpu is None:
+        use_tpu = _is_tpu()
+    if use_tpu:
+        try:
+            import torch_xla.core.xla_model as xm
+        except ImportError:
+            raise ImportError("TPU requested but torch_xla not installed. Run the 'TPU setup' cell first.")
+        device = xm.xla_device()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+        model = model.to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            load_in_8bit=True,
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
@@ -393,6 +421,77 @@ def run_easy_distill(config_path: str) -> int:
     return result.returncode
 
 
+def run_training_tpu(
+    labeled_path: str,
+    student_model: str,
+    out_dir: str,
+    num_epochs: int = 1,
+    max_length: int = 512,
+    learning_rate: float = 2e-5,
+) -> int:
+    """
+    Run SFT training on TPU (no EasyDistill/vllm). Uses the same data format as System 1.
+    Returns 0 on success.
+    """
+    from datasets import Dataset
+    from trl import SFTConfig, SFTTrainer
+    import torch_xla.core.xla_model as xm
+
+    data = read_json(labeled_path)
+    if not data:
+        print("No labeled data for TPU training")
+        return 1
+    # Format as Qwen-style chat for SFT
+    def _format(ex):
+        inst = ex.get("instruction", "")
+        out = ex.get("output", "")
+        return (
+            "<|im_start|>user\n" + inst + "<|im_end|>\n"
+            "<|im_start|>assistant\n" + out + "<|im_end|>"
+        )
+    texts = [_format(ex) for ex in data]
+    dataset = Dataset.from_dict({"text": texts})
+
+    tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        student_model,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    device = xm.xla_device()
+    model = model.to(device)
+
+    args = SFTConfig(
+        output_dir=out_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        max_seq_length=max_length,
+        learning_rate=learning_rate,
+        weight_decay=0.05,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        bf16=True,
+        logging_steps=10,
+        save_steps=200,
+    )
+    trainer = SFTTrainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        tokenizer=tokenizer,
+        dataset_text_field="text",
+        max_seq_length=max_length,
+    )
+    trainer.train()
+    trainer.save_model(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    print("TPU training finished. Checkpoint at:", out_dir)
+    return 0
+
+
 # ---------------------------
 # High-level entry points
 # ---------------------------
@@ -432,6 +531,19 @@ def distill_system1(config: Dict[str, Any]) -> Optional[str]:
     if not data or len(data) == 0:
         print("No data for System 1 distillation")
         return None
+
+    if _is_tpu():
+        print("TPU detected: using TPU training path (no vllm).")
+        code = run_training_tpu(
+            labeled_path=labeled_path,
+            student_model=student_model,
+            out_dir=out_dir,
+            num_epochs=num_epochs,
+        )
+        if code != 0:
+            return None
+        print("Summary: System 1 distillation (TPU) finished. Checkpoint at:", out_dir)
+        return out_dir
 
     write_system1_config(
         teacher_model=teacher_model,
