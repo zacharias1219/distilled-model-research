@@ -83,11 +83,20 @@ def load_teacher(model_name: str, use_tpu: Optional[bool] = None):
         )
         model = model.to(device)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            load_in_8bit=True,
-        )
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                load_in_8bit=True,
+            )
+        except Exception:
+            print("8-bit loading failed (no GPU?). Falling back to float16 on CPU/auto.")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
@@ -261,31 +270,60 @@ def prepare_system2_dataset(
             )
         else:
             raise
-    print("First OmniThought sample keys:", list(omni[0].keys()))
+    sample_keys = list(omni[0].keys())
+    print("First OmniThought sample keys:", sample_keys)
 
-    if not (
-        ("instruction" in omni[0] or "question" in omni[0] or "input" in omni[0])
-        and ("cot" in omni[0] or "output" in omni[0] or "answer" in omni[0])
-    ):
-        print("Unexpected OmniThought schema, please inspect omni[0]:", omni[0])
+    has_question = "instruction" in omni[0] or "question" in omni[0] or "input" in omni[0]
+    has_reasoning_list = "reasoning" in omni[0] and isinstance(omni[0]["reasoning"], list)
+    has_flat_cot = "cot" in omni[0] or "output" in omni[0] or "answer" in omni[0]
+
+    if not has_question or (not has_reasoning_list and not has_flat_cot):
+        print("Unexpected OmniThought schema, please inspect omni[0]:")
+        print({k: type(v).__name__ for k, v in omni[0].items()})
         return
 
-    has_rv = "rv_score" in omni[0]
-    has_cd = "cd_score" in omni[0]
-
-    if has_rv and has_cd:
-        omni = omni.filter(
-            lambda x: x["rv_score"] >= rv_min and x["cd_score"] >= cd_min
-        )
-        print(f"Filtered by RV/CD, remaining samples: {len(omni)}")
-    else:
-        print("RV/CD scores not found, using raw slice:", len(omni))
-
     items = []
-    for ex in omni:
-        instr = ex.get("instruction") or ex.get("question") or ex.get("input", "")
-        cot = ex.get("cot") or ex.get("output") or ex.get("answer", "")
-        items.append({"instruction": instr, "input": "", "output": cot})
+
+    if has_reasoning_list:
+        # OmniThought v2 schema: reasoning is a list of dicts, each with
+        #   Cognitive_Difficulty.level, Reasoning_Verbosity.level,
+        #   full_response, solution, thought, teacher, ...
+        cd_thresh = rv_min * 10 if rv_min <= 1.0 else rv_min
+        rv_thresh = cd_min * 10 if cd_min <= 1.0 else cd_min
+        for ex in omni:
+            instr = ex.get("question") or ex.get("instruction") or ex.get("input", "")
+            entries = ex.get("reasoning", [])
+            if not entries:
+                continue
+            best = None
+            for entry in entries:
+                cd_lvl = entry.get("Cognitive_Difficulty", {}).get("level", 0)
+                rv_lvl = entry.get("Reasoning_Verbosity", {}).get("level", 0)
+                if cd_lvl >= cd_thresh and rv_lvl >= rv_thresh:
+                    best = entry
+                    break
+            if best is None:
+                best = entries[0]
+            cot = best.get("full_response") or best.get("solution") or best.get("thought", "")
+            if not cot or not cot.strip():
+                continue
+            items.append({"instruction": instr, "input": "", "output": cot})
+        print(f"Extracted {len(items)} CoT samples from reasoning entries (CD>={cd_thresh}, RV>={rv_thresh})")
+    else:
+        # Flat schema with top-level rv_score / cd_score
+        has_rv = "rv_score" in omni[0]
+        has_cd = "cd_score" in omni[0]
+        if has_rv and has_cd:
+            omni = omni.filter(
+                lambda x: x["rv_score"] >= rv_min and x["cd_score"] >= cd_min
+            )
+            print(f"Filtered by RV/CD, remaining samples: {len(omni)}")
+        else:
+            print("RV/CD scores not found, using raw slice:", len(omni))
+        for ex in omni:
+            instr = ex.get("instruction") or ex.get("question") or ex.get("input", "")
+            cot = ex.get("cot") or ex.get("output") or ex.get("answer", "")
+            items.append({"instruction": instr, "input": "", "output": cot})
 
     if len(items) == 0:
         print("No data for System 2 distillation after filtering.")
@@ -538,8 +576,9 @@ def distill_system1(config: Dict[str, Any]) -> Optional[str]:
         )
         if code != 0:
             return None
-        print("Summary: System 1 distillation (TPU) finished. Checkpoint at:", out_dir)
-        return out_dir
+        resolved = str(Path(out_dir).resolve())
+        print("Summary: System 1 distillation (TPU) finished. Checkpoint at:", resolved)
+        return resolved
 
     write_system1_config(
         teacher_model=teacher_model,
@@ -553,8 +592,9 @@ def distill_system1(config: Dict[str, Any]) -> Optional[str]:
     code = run_easy_distill(config_path)
     if code != 0:
         return None
-    print("Summary: System 1 distillation finished. Checkpoint at:", out_dir)
-    return out_dir
+    resolved = str(Path(out_dir).resolve())
+    print("Summary: System 1 distillation finished. Checkpoint at:", resolved)
+    return resolved
 
 
 def distill_system2(config: Dict[str, Any]) -> Optional[str]:
@@ -594,8 +634,9 @@ def distill_system2(config: Dict[str, Any]) -> Optional[str]:
     code = run_easy_distill(config_path)
     if code != 0:
         return None
-    print("Summary: System 2 distillation finished. Checkpoint at:", out_dir)
-    return out_dir
+    resolved = str(Path(out_dir).resolve())
+    print("Summary: System 2 distillation finished. Checkpoint at:", resolved)
+    return resolved
 
 
 # ---------------------------
