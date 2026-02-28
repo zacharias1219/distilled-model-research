@@ -593,13 +593,13 @@ def run_easy_distill(config_path: str) -> int:
     Config path is resolved to absolute so EasyDistill (which joins relative paths with
     its package dir) loads the correct file when we run from our project root.
     Uses the same Python as the current process so the CLI is found after pip install -e.
-    Captures stdout/stderr for diagnostic output.
+    Captures stdout/stderr and detects real errors even when the CLI exits 0.
     """
     abs_config = str(Path(config_path).resolve())
     cmd = [sys.executable, "-m", "easydistill.cli", "--config", abs_config]
     print("Running:", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
-    # Print last 50 lines of stdout for diagnostics
+
     if result.stdout:
         lines = result.stdout.strip().splitlines()
         if len(lines) > 50:
@@ -608,17 +608,122 @@ def run_easy_distill(config_path: str) -> int:
             print(line)
     if result.stderr:
         err_lines = result.stderr.strip().splitlines()
-        # Show last 20 lines of stderr (often warnings)
         for line in err_lines[-20:]:
             print("[stderr]", line)
-    if result.returncode == 0:
-        print("EasyDistill run completed successfully.")
-    else:
-        print("EasyDistill run failed with code:", result.returncode)
-        if result.stderr:
-            print("Full stderr:")
+
+    # EasyDistill CLI often exits 0 even when internal subprocesses crash.
+    # Detect real failures by scanning stderr for fatal error patterns.
+    _fatal = ["Traceback", "ModuleNotFoundError", "ImportError",
+              "Command failed", "Infer failed", "skipping training",
+              "RuntimeError", "CUDA out of memory"]
+    stderr_has_fatal = any(kw in (result.stderr or "") for kw in _fatal)
+
+    if result.returncode != 0 or stderr_has_fatal:
+        reason = f"returncode={result.returncode}"
+        if stderr_has_fatal:
+            reason += " + fatal errors detected in stderr"
+        print(f"EasyDistill run FAILED ({reason}).")
+        if result.stderr and result.returncode != 0:
+            print("Full stderr (last 2000 chars):")
             print(result.stderr[-2000:])
-    return result.returncode
+        return result.returncode if result.returncode != 0 else 1
+
+    print("EasyDistill run completed successfully.")
+    return 0
+
+
+def run_training_sft(
+    labeled_path: str,
+    student_model: str,
+    out_dir: str,
+    num_epochs: int = 1,
+    max_length: int = 512,
+    learning_rate: float = 2e-5,
+    batch_size: int = 2,
+) -> int:
+    """Direct SFT training using trl.SFTTrainer (GPU or CPU).
+
+    This is the primary fallback when EasyDistill CLI fails (missing deps,
+    DeepSpeed issues, etc.). It produces a full checkpoint compatible with
+    ``load_student()``.
+    """
+    from datasets import Dataset
+
+    try:
+        from trl import SFTConfig, SFTTrainer
+    except ImportError:
+        print("trl not installed. Run: pip install trl")
+        return 1
+
+    data = read_json(labeled_path)
+    if not data:
+        print("No labeled data for SFT training")
+        return 1
+
+    def _format(ex):
+        inst = ex.get("instruction", "")
+        out = ex.get("output", "")
+        return (
+            "<|im_start|>user\n" + inst + "<|im_end|>\n"
+            "<|im_start|>assistant\n" + out + "<|im_end|>"
+        )
+
+    texts = [_format(ex) for ex in data]
+    dataset = Dataset.from_dict({"text": texts})
+
+    tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    use_fp16 = False
+    if torch.cuda.is_available():
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                student_model, torch_dtype=torch.float16, device_map="auto",
+            )
+            use_fp16 = True
+            print(f"Loaded student '{student_model}' on GPU (float16) for SFT.")
+        except Exception as e:
+            print(f"GPU loading failed ({e}), falling back to CPU.")
+            model = AutoModelForCausalLM.from_pretrained(
+                student_model, torch_dtype=torch.float32, low_cpu_mem_usage=True,
+            )
+    else:
+        print(f"No GPU detected. Loading student '{student_model}' on CPU (float32). Training will be slow.")
+        model = AutoModelForCausalLM.from_pretrained(
+            student_model, torch_dtype=torch.float32, low_cpu_mem_usage=True,
+        )
+
+    args = SFTConfig(
+        output_dir=out_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=8,
+        max_seq_length=max_length,
+        learning_rate=learning_rate,
+        weight_decay=0.05,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        fp16=use_fp16,
+        bf16=False,
+        logging_steps=10,
+        save_steps=200,
+        save_total_limit=2,
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+    )
+
+    print(f"Starting SFT training: {len(dataset)} samples, {num_epochs} epoch(s)...")
+    trainer.train()
+    trainer.save_model(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    print("SFT training finished. Checkpoint at:", out_dir)
+    return 0
 
 
 def run_training_tpu(
@@ -762,18 +867,29 @@ def distill_system1(config: Dict[str, Any]) -> Optional[str]:
         template_path=config.get("template_path"),
     )
     code = run_easy_distill(config_path)
-    if code != 0:
-        return None
 
-    # Validate checkpoint after training
+    if code != 0:
+        print("\nEasyDistill CLI failed. Falling back to direct SFT training...")
+        print("(This uses pre-existing labels from the dataset instead of teacher inference.)\n")
+        code = run_training_sft(
+            labeled_path=labeled_path,
+            student_model=student_model,
+            out_dir=out_dir,
+            num_epochs=num_epochs,
+            max_length=512,
+            learning_rate=2e-5,
+        )
+        if code != 0:
+            print("SFT fallback also failed.")
+            return None
+
     resolved = find_checkpoint(out_dir)
     if resolved:
         print("Summary: System 1 distillation finished. Checkpoint at:", resolved)
         return resolved
     else:
-        print(f"WARNING: EasyDistill exited successfully but no model files found in {out_dir}")
+        print(f"WARNING: Training finished but no model files found in {out_dir}")
         print(f"Directory contents: {list(Path(out_dir).rglob('*'))[:20] if Path(out_dir).exists() else '(dir does not exist)'}")
-        # Return the dir anyway so the user can inspect
         return str(Path(out_dir).resolve())
 
 
@@ -818,16 +934,27 @@ def distill_system2(config: Dict[str, Any]) -> Optional[str]:
         template_path=config.get("template_path"),
     )
     code = run_easy_distill(config_path)
-    if code != 0:
-        return None
 
-    # Validate checkpoint after training
+    if code != 0:
+        print("\nEasyDistill CLI failed. Falling back to direct SFT training on CoT data...")
+        code = run_training_sft(
+            labeled_path=cot_path,
+            student_model=student_model,
+            out_dir=out_dir,
+            num_epochs=num_epochs,
+            max_length=1024,
+            learning_rate=1e-5,
+        )
+        if code != 0:
+            print("SFT fallback also failed.")
+            return None
+
     resolved = find_checkpoint(out_dir)
     if resolved:
         print("Summary: System 2 distillation finished. Checkpoint at:", resolved)
         return resolved
     else:
-        print(f"WARNING: EasyDistill exited successfully but no model files found in {out_dir}")
+        print(f"WARNING: Training finished but no model files found in {out_dir}")
         print(f"Directory contents: {list(Path(out_dir).rglob('*'))[:20] if Path(out_dir).exists() else '(dir does not exist)'}")
         return str(Path(out_dir).resolve())
 
