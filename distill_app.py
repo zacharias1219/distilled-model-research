@@ -11,6 +11,7 @@ Responsibilities:
 - Load & query student models
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -124,26 +125,29 @@ def _is_tpu() -> bool:
     colab_tpu_addr = os.environ.get("COLAB_TPU_ADDR")
     pjrt_dev = Path("/dev/accel0").exists()
     tpu_name = os.environ.get("TPU_NAME")
+    xla_spec = importlib.util.find_spec("torch_xla") is not None
     # #region agent log
-    _dlog("TPU env check", {"COLAB_TPU_ADDR": colab_tpu_addr, "pjrt_dev": pjrt_dev, "TPU_NAME": tpu_name}, "H1")
+    _dlog("TPU env check", {"COLAB_TPU_ADDR": colab_tpu_addr, "pjrt_dev": pjrt_dev, "TPU_NAME": tpu_name, "xla_pkg_installed": xla_spec}, "H4")
     # #endregion
     if colab_tpu_addr:
         return True
 
-    # Check for newer TPU runtimes (v4+/v5e/v6e) that use PJRT
+    # Check for newer TPU runtimes (v4+/v5e/v6e) — torch_xla is pre-installed
     try:
         import torch_xla
         # #region agent log
-        _dlog("torch_xla imported OK", {"version": getattr(torch_xla, "__version__", "unknown")}, "H3")
+        _dlog("torch_xla imported OK", {"version": getattr(torch_xla, "__version__", "unknown")}, "H4")
         # #endregion
-    except ImportError:
+    except (ImportError, OSError, RuntimeError) as exc:
+        # torch_xla package exists but may fail to load (ABI mismatch)
+        # If the package is installed, we're still on a TPU runtime
         # #region agent log
-        _dlog("torch_xla NOT installed", {"pjrt_dev": pjrt_dev}, "H3")
+        _dlog("torch_xla import failed but pkg exists", {"error": str(exc)[:200], "xla_spec": xla_spec}, "H4")
         # #endregion
-        if pjrt_dev or tpu_name:
-            _dlog("TPU hardware present but torch_xla not installed!", {"pjrt_dev": pjrt_dev, "tpu_name": tpu_name}, "H3")
-            print("WARNING: TPU hardware detected (/dev/accel0 or TPU_NAME) but torch_xla is not installed.")
-            print("Run the 'TPU setup' cell first, then restart the runtime.")
+        if xla_spec:
+            print(f"WARNING: torch_xla installed but broken ({type(exc).__name__}). "
+                  "Likely torch version mismatch. Restart runtime after TPU setup cell.")
+            return True
         return False
 
     try:
@@ -704,8 +708,13 @@ def run_training_sft(
 
     try:
         from trl import SFTConfig, SFTTrainer
-    except ImportError:
-        print("trl not installed. Run: pip install trl")
+    except (ImportError, RuntimeError, OSError) as e:
+        if "torch_xla" in str(e) or "_XLAC" in str(e):
+            print(f"trl/transformers import failed due to broken torch_xla: {e}")
+            print("Fix: restart runtime after the TPU setup cell, WITHOUT upgrading torch.")
+            print("Or uninstall torch_xla if you're on GPU: pip uninstall torch_xla -y")
+        else:
+            print(f"trl not available: {e}. Run: pip install trl")
         return 1
 
     data = read_json(labeled_path)
