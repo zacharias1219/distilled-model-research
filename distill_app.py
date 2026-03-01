@@ -874,9 +874,7 @@ def run_training_tpu(
         model=model,
         args=args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
-        dataset_text_field="text",
-        max_seq_length=max_length,
+        processing_class=tokenizer,
     )
     trainer.train()
     trainer.save_model(out_dir)
