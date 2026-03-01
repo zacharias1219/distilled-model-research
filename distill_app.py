@@ -122,8 +122,10 @@ def _is_tpu() -> bool:
     # #endregion
 
     colab_tpu_addr = os.environ.get("COLAB_TPU_ADDR")
+    pjrt_dev = Path("/dev/accel0").exists()
+    tpu_name = os.environ.get("TPU_NAME")
     # #region agent log
-    _dlog("COLAB_TPU_ADDR check", {"value": colab_tpu_addr}, "H1")
+    _dlog("TPU env check", {"COLAB_TPU_ADDR": colab_tpu_addr, "pjrt_dev": pjrt_dev, "TPU_NAME": tpu_name}, "H1")
     # #endregion
     if colab_tpu_addr:
         return True
@@ -136,8 +138,12 @@ def _is_tpu() -> bool:
         # #endregion
     except ImportError:
         # #region agent log
-        _dlog("torch_xla NOT installed", {}, "H3")
+        _dlog("torch_xla NOT installed", {"pjrt_dev": pjrt_dev}, "H3")
         # #endregion
+        if pjrt_dev or tpu_name:
+            _dlog("TPU hardware present but torch_xla not installed!", {"pjrt_dev": pjrt_dev, "tpu_name": tpu_name}, "H3")
+            print("WARNING: TPU hardware detected (/dev/accel0 or TPU_NAME) but torch_xla is not installed.")
+            print("Run the 'TPU setup' cell first, then restart the runtime.")
         return False
 
     try:
