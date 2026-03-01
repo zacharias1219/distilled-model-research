@@ -112,12 +112,59 @@ def check_resume(out_dir: str) -> Optional[str]:
 
 def _is_tpu() -> bool:
     """True if TPU is available (e.g. Colab TPU runtime)."""
-    if os.environ.get("COLAB_TPU_ADDR"):
+    # #region agent log
+    import json as _j, time as _t
+    def _dlog(msg, data, hyp=""):
+        try:
+            with open("debug-5b3ceb.log", "a") as _f:
+                _f.write(_j.dumps({"sessionId":"5b3ceb","location":"distill_app.py:_is_tpu","message":msg,"data":data,"hypothesisId":hyp,"timestamp":int(_t.time()*1000)})+"\n")
+        except: pass
+    # #endregion
+
+    colab_tpu_addr = os.environ.get("COLAB_TPU_ADDR")
+    # #region agent log
+    _dlog("COLAB_TPU_ADDR check", {"value": colab_tpu_addr}, "H1")
+    # #endregion
+    if colab_tpu_addr:
         return True
+
+    # Check for newer TPU runtimes (v4+/v5e/v6e) that use PJRT
+    try:
+        import torch_xla
+        # #region agent log
+        _dlog("torch_xla imported OK", {"version": getattr(torch_xla, "__version__", "unknown")}, "H3")
+        # #endregion
+    except ImportError:
+        # #region agent log
+        _dlog("torch_xla NOT installed", {}, "H3")
+        # #endregion
+        return False
+
     try:
         import torch_xla.core.xla_model as xm
-        return xm.xrt_world_size() > 0
-    except Exception:
+        dev = xm.xla_device()
+        dev_type = str(dev.type) if dev else "none"
+        # #region agent log
+        _dlog("xla_device result", {"device": str(dev), "type": dev_type}, "H3")
+        # #endregion
+        return dev_type == "xla"
+    except Exception as e:
+        # #region agent log
+        _dlog("xla_device failed, trying runtime API", {"error": str(e)}, "H3")
+        # #endregion
+        pass
+
+    try:
+        import torch_xla.runtime as xr
+        num_devices = xr.global_runtime_device_count()
+        # #region agent log
+        _dlog("torch_xla.runtime device count", {"count": num_devices}, "H3")
+        # #endregion
+        return num_devices > 0
+    except Exception as e2:
+        # #region agent log
+        _dlog("torch_xla.runtime also failed", {"error": str(e2)}, "H3")
+        # #endregion
         return False
 
 
@@ -675,8 +722,36 @@ def run_training_sft(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Detect device: TPU > GPU > CPU
+    _tpu_avail = _is_tpu()
+    _cuda_avail = torch.cuda.is_available()
+    # #region agent log
+    import json as _j3, time as _t3
+    try:
+        with open("debug-5b3ceb.log", "a") as _f:
+            _f.write(_j3.dumps({"sessionId":"5b3ceb","location":"distill_app.py:run_training_sft","message":"device detection","data":{"tpu":_tpu_avail,"cuda":_cuda_avail,"student_model":student_model},"hypothesisId":"H2","timestamp":int(_t3.time()*1000)})+"\n")
+    except: pass
+    # #endregion
+
     use_fp16 = False
-    if torch.cuda.is_available():
+    use_bf16 = False
+    model = None
+
+    if _tpu_avail:
+        try:
+            import torch_xla.core.xla_model as xm
+            model = AutoModelForCausalLM.from_pretrained(
+                student_model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+            )
+            device = xm.xla_device()
+            model = model.to(device)
+            use_bf16 = True
+            print(f"Loaded student '{student_model}' on TPU (bfloat16) for SFT.")
+        except Exception as e:
+            print(f"TPU loading failed ({e}), trying GPU/CPU.")
+            model = None
+
+    if model is None and _cuda_avail:
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 student_model, torch_dtype=torch.float16, device_map="auto",
@@ -685,11 +760,9 @@ def run_training_sft(
             print(f"Loaded student '{student_model}' on GPU (float16) for SFT.")
         except Exception as e:
             print(f"GPU loading failed ({e}), falling back to CPU.")
-            model = AutoModelForCausalLM.from_pretrained(
-                student_model, torch_dtype=torch.float32, low_cpu_mem_usage=True,
-            )
-    else:
-        print(f"No GPU detected. Loading student '{student_model}' on CPU (float32). Training will be slow.")
+
+    if model is None:
+        print(f"No GPU/TPU available. Loading student '{student_model}' on CPU (float32). Training will be slow.")
         model = AutoModelForCausalLM.from_pretrained(
             student_model, torch_dtype=torch.float32, low_cpu_mem_usage=True,
         )
@@ -705,7 +778,7 @@ def run_training_sft(
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         fp16=use_fp16,
-        bf16=False,
+        bf16=use_bf16,
         logging_steps=10,
         save_steps=200,
         save_total_limit=2,
@@ -843,7 +916,16 @@ def distill_system1(config: Dict[str, Any]) -> Optional[str]:
         print(f"Existing checkpoint found at {existing}. Skipping training (delete to retrain).")
         return existing
 
-    if _is_tpu():
+    tpu_detected = _is_tpu()
+    # #region agent log
+    import json as _j2, time as _t2
+    try:
+        with open("debug-5b3ceb.log", "a") as _f:
+            _f.write(_j2.dumps({"sessionId":"5b3ceb","location":"distill_app.py:distill_system1","message":"path selection","data":{"tpu_detected":tpu_detected,"cuda_available":torch.cuda.is_available()},"hypothesisId":"H1","timestamp":int(_t2.time()*1000)})+"\n")
+    except: pass
+    # #endregion
+
+    if tpu_detected:
         print("TPU detected: using TPU training path (no vllm).")
         code = run_training_tpu(
             labeled_path=labeled_path,
@@ -924,6 +1006,24 @@ def distill_system2(config: Dict[str, Any]) -> Optional[str]:
     if existing:
         print(f"Existing checkpoint found at {existing}. Skipping training (delete to retrain).")
         return existing
+
+    # TPU path: skip EasyDistill (vllm is GPU-only), go straight to SFT
+    if _is_tpu():
+        print("TPU detected: using direct SFT training for System 2 (no vllm).")
+        code = run_training_sft(
+            labeled_path=cot_path,
+            student_model=student_model,
+            out_dir=out_dir,
+            num_epochs=num_epochs,
+            max_length=1024,
+            learning_rate=1e-5,
+        )
+        if code != 0:
+            print("TPU SFT training failed.")
+            return None
+        resolved = find_checkpoint(out_dir) or str(Path(out_dir).resolve())
+        print("Summary: System 2 distillation (TPU) finished. Checkpoint at:", resolved)
+        return resolved
 
     write_system2_config(
         student_model=student_model,
